@@ -42,7 +42,8 @@ include("../../MA_best/FLOP_count.jl")
 function correction_equations_minres(A, U, lambdas, R; tol=1e-1, maxiter=100)
     global NFLOPs
     n, k = size(U)
-    S = zeros(eltype(A), n, k)
+    T_elem = eltype(U)
+    S = zeros(T_elem, n, k)
     total_iter = 0
 
     for j in 1:k
@@ -52,7 +53,11 @@ function correction_equations_minres(A, U, lambdas, R; tol=1e-1, maxiter=100)
             x_perp = x - (U * (U' * x)); 
             count_matmul_flops(k,1,n); count_matmul_flops(n,1,k); count_vec_add_flops(n)
 
-            tmp = (A * x_perp) - λ * x_perp; 
+            # Reshape to matrix for A multiplication
+            x_perp_mat = reshape(x_perp, :, 1)
+            tmp_mat = (A * x_perp_mat) - λ * x_perp_mat
+            tmp = vec(tmp_mat)  # Convert back to vector
+            
             count_matmul_flops(n,1,n); count_vec_scaling_flops(n); count_vec_add_flops(n)
 
             res = tmp - (U * (U' * tmp)); 
@@ -60,7 +65,7 @@ function correction_equations_minres(A, U, lambdas, R; tol=1e-1, maxiter=100)
             return res
         end
 
-        M_op = LinearMap{eltype(A)}(M_apply, n, n; ishermitian=true)
+        M_op = LinearMap{T_elem}(M_apply, n, n; ishermitian=true)
 
         rhs = r - (U * (U' * r)); 
         count_matmul_flops(k,1,n); count_matmul_flops(n,1,k); count_vec_add_flops(n)
@@ -71,7 +76,6 @@ function correction_equations_minres(A, U, lambdas, R; tol=1e-1, maxiter=100)
         if m !== nothing
             niter = parse(Int, m.captures[1])
             total_iter += niter
-            # println("Number of iterations: ", niter)
         else
             println("No iteration number found in message: ", msg)
         end
@@ -85,7 +89,6 @@ function correction_equations_minres(A, U, lambdas, R; tol=1e-1, maxiter=100)
     NFLOPs += total_iter * (2*n^2 + 4*n*k)  
     return S
 end
-
 
 function select_corrections_ORTHO(t_candidates, V, V_lock, η, droptol; maxorth=2)
     n, ν = size(t_candidates)
@@ -209,16 +212,18 @@ function is_stagnating(hist::Vector{Float64}; tol=0.1, window=2)
 end
 
 function davidson(
-    A::ProjectedShiftedOperator, # linear operator
-    D_real::AbstractArray{<:Real, 3}, # precondition in real space
-    V::Matrix{T},
+    A::ProjectedShiftedOperator,
+    D_real::AbstractArray{<:Real, 3},
+    V::AbstractMatrix{T},
+    eigenvectors_pool::AbstractMatrix{T},
     n_aux::Integer,
     l::Integer,
     thresh::Float64,
     max_iter::Integer,
-    all_idxs::Vector{Int})::Tuple{Vector{Float64}, Matrix{T}} where T<:AbstractFloat
+    all_idxs::Vector{Int}
+)::Tuple{Vector{Float64}, Matrix{T}} where {T <: Complex}
 
-    n = size(A, 1)
+    n = size(V, 1)
     n_b = size(V, 2)
     l_buffer = max(1, round(Int, l * 1.75))
     nu_0 = max(l_buffer, n_b)
@@ -239,7 +244,7 @@ function davidson(
     residual_histories = EVHistory[]
     # Track convergence cool-down for each sorted position
     converged_cooldown = DefaultDict{Int, Int}(() -> 0)
-    cooldown_iters = 3   # keep converged eigenvalues/groups for 3 extra iterations
+    cooldown_iters = 1   # keep converged eigenvalues/groups for 3 extra iterations
 
     iter = 0
 
@@ -431,7 +436,7 @@ function davidson(
 
         # --- Compute correction vectors ---
         ϵ = 1e-8
-        t = zeros(T, n, length(keep_positions))
+        t = zeros(eltype(V), n, length(keep_positions))
 
         if iter < 9
             for (i_local, pos) in enumerate(keep_positions)
@@ -469,7 +474,7 @@ function davidson(
             println("Using Davidson for $(length(dav_indices)) vectors, JD for $(length(jd_indices)) vectors.")
 
             # Davidson corrections
-            t_dav = zeros(T, n, length(dav_indices))
+            t_dav = zeros(eltype(V), n, length(dav_indices))
             for (j, i_local) in enumerate(dav_indices)
                     R_real = ifft(basis, kpt, R_nc[:, i_local]) # FFT to real space
                     C = -1.0 ./ (D_real .- Σ_nc[i_local])
@@ -484,7 +489,7 @@ function davidson(
                 R_jd = R_nc[:, jd_indices]
                 t_jd = correction_equations_minres(A, X_jd, Σ_jd, R_jd; tol=1e-1, maxiter=25)
             else
-                t_jd = zeros(T, n, 0)
+                t_jd = zeros(eltype(V), n, 0)
             end
 
             t = hcat(t_dav, t_jd)
@@ -500,22 +505,48 @@ function davidson(
 
         # Update search space V
         if size(V, 2) + n_b_hat > n_aux && n_c > 0
-            extra_idx = all_idxs[(Nlow+1+(nevf - n_c)) : (Nlow+nevf)]
-            if size(X_nc, 2) == 0
-                println("Warning: X_nc is empty when rebuilding V, using only T_hat, size = $(size(T_hat)) and extra A columns, size = $(size(A[:, extra_idx])).")
+            start_idx = Nlow + 1 + (nevf - n_c)
+            end_idx = Nlow + nevf
+            
+            # Clamp to valid range
+            start_idx = max(1, min(start_idx, length(all_idxs)))
+            end_idx = max(start_idx, min(end_idx, length(all_idxs)))
+            
+            if start_idx <= end_idx && end_idx <= length(all_idxs)
+                extra_idx = all_idxs[start_idx:end_idx]
+                if size(X_nc, 2) == 0
+                    println("Warning: X_nc is empty when rebuilding V, using only T_hat and extra vectors.")
+                end
+                max_new_size = n_aux - size(X_nc, 2) - length(extra_idx)
+                T_hat = T_hat[:, 1:min(n_b_hat, max(0, max_new_size))]
+                V = hcat(X_nc, T_hat, eigenvectors_pool[:, extra_idx])
+            else
+                # Pool exhausted
+                max_new_size = n_aux - size(X_nc, 2)
+                T_hat = T_hat[:, 1:min(n_b_hat, max(0, max_new_size))]
+                V = hcat(X_nc, T_hat)
             end
-            max_new_size = n_aux - size(X_nc, 2)
-            T_hat = T_hat[:, 1:min(n_b_hat, max_new_size)]
-            V = hcat(X_nc, T_hat, A[:, extra_idx])
 
         elseif size(V, 2) + n_b_hat > n_aux || n_b_hat == 0
             max_new_size = n_aux - size(X_nc, 2)
-            T_hat = T_hat[:, 1:min(n_b_hat, max_new_size)]            
+            T_hat = T_hat[:, 1:min(n_b_hat, max(0, max_new_size))]            
             V = hcat(X_nc, T_hat)
 
         elseif n_c > 0
-            extra_idx = all_idxs[(Nlow+1+(nevf - n_c)) : (Nlow+nevf)]
-            V = hcat(V, T_hat, A[:, extra_idx])
+            start_idx = Nlow + 1 + (nevf - n_c)
+            end_idx = Nlow + nevf
+            
+            # Clamp to valid range
+            start_idx = max(1, min(start_idx, length(all_idxs)))
+            end_idx = max(start_idx, min(end_idx, length(all_idxs)))
+            
+            if start_idx <= end_idx && end_idx <= length(all_idxs)
+                extra_idx = all_idxs[start_idx:end_idx]
+                V = hcat(V, T_hat, eigenvectors_pool[:, extra_idx])
+            else
+                # Pool exhausted
+                V = hcat(V, T_hat)
+            end
 
         else
             V = hcat(V, T_hat)
@@ -523,10 +554,21 @@ function davidson(
 
         n_b = size(V, 2)
 
-        if size(V, 2)==0
-            println("Warning: V is empty, rebuilding from A columns.")
-            extra_idx = all_idxs[(Nlow+1+(nevf - n_c)): (Nlow+nevf + Nlow)] # take some extra columns to avoid empty V
-            V = A[:, extra_idx]
+        if size(V, 2) == 0
+            println("Warning: V is empty, rebuilding from eigenvector pool.")
+            start_idx = Nlow + 1 + (nevf - n_c)
+            end_idx = Nlow + nevf + Nlow
+            
+            # Clamp to valid range
+            start_idx = max(1, min(start_idx, length(all_idxs)))
+            end_idx = max(start_idx, min(end_idx, length(all_idxs)))
+            
+            if start_idx <= end_idx && end_idx <= length(all_idxs)
+                extra_idx = all_idxs[start_idx:end_idx]
+                V = eigenvectors_pool[:, extra_idx]
+            else
+                error("Cannot rebuild V: eigenvector pool exhausted and no vectors available")
+            end
         end
     end
 

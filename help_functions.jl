@@ -181,13 +181,13 @@ function davidson_tobias(
 
         # DOESN'T HELP
         # update guess space using preconditioner 
-        #t = zero(similar(R)) 
-        #for i = 1:size(t,2)
+        # t = zero(similar(R)) 
+        # for i = 1:size(t,2)
         #   R_real = ifft(basis, kpt, R[:,i]) # FFT to real space
         #   C = -1.0 ./ (D_real .- Σ[i])
         #   t_real = C .* R_real # apply C
         #   t[:,i] = fft(basis, kpt, t_real) # FFT back to reciprocal space
-        #end
+        # end
         
         t = R # no preconditioner
 

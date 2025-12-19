@@ -121,20 +121,9 @@ function main()
     Kϕk = Kk_virt * ϕk
     γ = ϕk' * Kϕk
     γ = Hermitian(γ)
-    eigenvalues, eigenvectors = eigen(γ)
-    println(eigenvalues[1:4])
+    eigenvalues_γ, eigenvectors_γ = eigen(γ)
+    println(eigenvalues_γ[1:4])
 
-    # holy cow... this is an extremely fast and accurate iterative solver: LOBPCG 
-    # can we beat it?
-    println("running LOBPCG...")
-    @time res = DFTK.lobpcg_hyper(Kk_virt, ϕk; prec=I, tol=1e-4)
-    println("Eigenvalues: ", res.λ[1:4])
-
-    # run the Davidson 
-    println("running Davidson...")
-    Naux = 5*N
-    @time Σ, U = davidson(Kk_virt, D_real, ϕk, ψocck, Naux, 1e-4)
-    println("Eigenvalues: ", real.(Σ[1:4]))
 
     # finally we construct a full basis for the exact result
     println("diagonalize K in full basis...")
@@ -149,6 +138,40 @@ function main()
     γ = Hermitian(γ)
     @time eigenvalues, eigenvectors = eigen(γ)
     println("Eigenvalues: ", real.(eigenvalues[1:4]))
+
+    # holy cow... this is an extremely fast and accurate iterative solver: LOBPCG 
+    # can we beat it?
+    println("running LOBPCG...")
+    @time res = DFTK.lobpcg_hyper(Kk_virt, ϕk; prec=I, tol=1e-6)
+    display("text/plain", (res.λ[1:N] - eigenvalues[1:N])')
+
+    # run the Davidson 
+    println("running Davidson...")
+    Naux = 10*N
+    l = 40                     # number of desired eigenpairs
+    thresh = 1e-5
+    max_iter = 200
+    sorted_indices = sortperm(abs.(eigenvalues_γ), rev=true)  # or sortperm(eigenvalues_γ) for ascending
+    eigenvalues_γ = eigenvalues_γ[sorted_indices]
+
+    # Use first Nlow eigenvectors as initial guess
+    V_full = ϕk * eigenvectors_γ[:, 1:N]
+    V = V_full[:, 1:10]  # pass only l initial guess vectors
+
+    # Pass all sorted indices to davidson
+    all_idxs = sorted_indices
+
+    # @time Σ, U = davidson(Kk_virt, D_real, V, V_full, Naux, l, thresh, max_iter, all_idxs)
+    # idx = sortperm(Σ)
+    # Σ = Σ[idx]
+
+    # display("text/plain", (Σ[1:N] - eigenvalues[1:N])')
+
+    @time Σ_ref, U_ref = davidson_tobias(Kk_virt, D_real, V_full, ψocck, Naux, thresh)
+
+    idx_ref = sortperm(real.(Σ_ref))
+    Σ_ref = Σ_ref[idx_ref]
+    display("text/plain", (real.(Σ_ref[1:N]) - eigenvalues[1:N])')
 end
 
 main()
